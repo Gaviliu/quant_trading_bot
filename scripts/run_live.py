@@ -1,3 +1,8 @@
+import asyncio
+try:
+    asyncio.get_running_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
 import os, time, yaml
 from dotenv import load_dotenv
 from decimal import Decimal
