@@ -1,0 +1,8 @@
+lighter-sdk
+pydantic>=2
+pandas>=2
+numpy>=1.24
+websockets>=12
+python-dotenv>=1
+pyyaml>=6
+requests>=2

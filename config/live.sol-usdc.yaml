@@ -1,0 +1,14 @@
+symbol: "SOL-USDC"
+leverage_target: 10.0
+risk_per_trade: 0.01
+max_position_usd: 10000
+max_daily_loss_usd: 500
+
+strategies:
+  - name: EMACrossover
+    params:
+      fast: 21
+      slow: 55
+
+execution:
+  type: "market"

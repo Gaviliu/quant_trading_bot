@@ -1,0 +1,17 @@
+[project]
+name = "quant_trading_bot"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "lighter-sdk",
+  "pydantic>=2",
+  "pandas>=2",
+  "numpy>=1.24",
+  "websockets>=12",
+  "python-dotenv>=1",
+  "pyyaml>=6",
+  "requests>=2",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
