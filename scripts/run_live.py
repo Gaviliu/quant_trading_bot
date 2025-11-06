@@ -4,6 +4,10 @@ from decimal import Decimal
 from bot.exchange_lighter import LighterClient
 from strategies.base import Bar
 from strategies.ema_crossover import EMACrossover
+from utils.logger import setup_logger
+log = setup_logger("live", "runtime.log")
+log.info("robot started")
+
 
 
 load_dotenv()
