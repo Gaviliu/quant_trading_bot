@@ -1,3 +1,5 @@
+LICENSE
+README.md
 pyproject.toml
 setup.cfg
 src/bot/__init__.py
@@ -10,3 +12,4 @@ src/quant_trading_bot.egg-info/top_level.txt
 src/strategies/__init__.py
 src/strategies/base.py
 src/strategies/ema_crossover.py
+src/utils/logger.py

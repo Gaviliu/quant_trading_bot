@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "quant_trading_bot"
 version = "0.1.0"
@@ -13,5 +17,8 @@ dependencies = [
   "requests>=2",
 ]
 
-[tool.pytest.ini_options]
-addopts = "-q"
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
