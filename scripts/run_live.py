@@ -52,6 +52,7 @@ async def main():
 
         # 用异步休眠，避免阻塞事件循环
         await asyncio.sleep(60)
+        print("Test")
 
 
 if __name__ == "__main__":
