@@ -11,4 +11,5 @@ Requires-Dist: websockets>=12
 Requires-Dist: python-dotenv>=1
 Requires-Dist: pyyaml>=6
 Requires-Dist: requests>=2
+Requires-Dist: aiohttp>=3.8
 Dynamic: license-file
