@@ -4,7 +4,10 @@ import asyncio
 import time
 import logging
 import sys
+import csv
 import aiohttp
+from datetime import datetime
+from pathlib import Path
 from dotenv import load_dotenv
 
 # 引入你的模块
@@ -18,34 +21,28 @@ class ColoredFormatter(logging.Formatter):
     red = "\x1b[31;20m"
     green = "\x1b[32;20m"
     blue = "\x1b[34;20m"
-    magenta = "\x1b[35;20m"   # 紫色 (TP/SL)
+    magenta = "\x1b[35;20m"
+    cyan = "\x1b[36;20m"
     reset = "\x1b[0m"
     fmt_str = "%(asctime)s [%(levelname)s] %(message)s"
 
     def format(self, record):
         log_fmt = self.fmt_str
-        if "BUY" in record.msg or "开多" in record.msg or "平空" in record.msg:
-            color = self.green
-        elif "SELL" in record.msg or "开空" in record.msg or "平多" in record.msg:
-            color = self.red
-        elif "成交确认" in record.msg:
-            color = self.green
-        elif "止盈" in record.msg or "止损" in record.msg:
-            color = self.magenta
-        elif "失败" in record.msg or "拒单" in record.msg or "无法确认" in record.msg:
-            color = self.red
-        elif record.levelno == logging.WARNING:
-            color = self.yellow
-        elif record.levelno == logging.ERROR:
-            color = self.red
-        elif "Heartbeat" in record.msg:
-            color = self.blue
-        else:
-            color = self.grey
+        if "BUY" in record.msg or "开多" in record.msg: color = self.green
+        elif "SELL" in record.msg or "开空" in record.msg: color = self.red
+        elif "成交确认" in record.msg: color = self.green
+        elif "止盈" in record.msg: color = self.magenta
+        elif "止损" in record.msg: color = self.magenta
+        elif "熔断" in record.msg: color = self.red 
+        elif "失败" in record.msg or "拒单" in record.msg: color = self.red
+        elif record.levelno == logging.WARNING: color = self.yellow
+        elif record.levelno == logging.ERROR: color = self.red
+        elif "Heartbeat" in record.msg: color = self.blue
+        elif "Data" in record.msg: color = self.cyan
+        else: color = self.grey
         formatter = logging.Formatter(f"{color}{log_fmt}{self.reset}")
         return formatter.format(record)
 
-# 强制接管日志
 log = logging.getLogger("LighterBot")
 log.setLevel(logging.INFO)
 log.propagate = False
@@ -55,28 +52,26 @@ ch.setFormatter(ColoredFormatter())
 log.addHandler(ch)
 
 # ================= 配置区域 =================
-CANDLE_INTERVAL = 300     # K线周期 (30秒)
-EMA_FAST = 9
+CANDLE_INTERVAL = 30     # K线周期 30s
+EMA_FAST = 3
 EMA_SLOW = 26
-init_band_bps = 50
+init_band_bps = 10
 TRADE_SIZE_SOL = 0.1      
-MAX_POSITION = 0.1        
+MAX_POSITION = 0.1        # 单方向最大持仓限制
 
-# --- 止盈止损与杠杆配置 ---
+# --- 风控配置 ---
 LEVERAGE = 10             # 杠杆倍数
 TAKE_PROFIT_PCT = 0.02    # 止盈 2% (ROE)
-STOP_LOSS_PCT = 0.02      # 止损 1% (ROE)
+STOP_LOSS_PCT = 0.02      # 止损 2% (ROE)
+DAILY_MAX_LOSS = 0.10     # 🔥 熔断线
 
-PRICE_DECIMALS = 3
+PRICE_DECIMALS = 3      # 价格精度 (官方确认)
 SIZE_DECIMALS = 3
-# 滑点设为 0.5% (50bps) 即可
-# 因为我们下面加了卖单精度补丁，不需要靠超大滑点来强撑了
-CROSS_OFFSET_BPS = 50     
+CROSS_OFFSET_BPS = 500     # 滑点 0.5%
 MARKET_ID = 2             # SOL
 PRICE_URL = "https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails?market_id=2"
-
-# 看板文件路径
 DASHBOARD_FILE = "DASHBOARD.md"
+DATA_DIR = "data"         
 
 class TradingBot:
     def __init__(self):
@@ -84,32 +79,54 @@ class TradingBot:
         self.client = None
         self.strategy = EMACrossover(fast=EMA_FAST, slow=EMA_SLOW, band_mode="bps", band_bps=init_band_bps, print_ema_each_bar=True)
         
-        # 实时状态
+        # 核心状态
         self.current_position = 0.0
         self.entry_price = 0.0
+        self.initial_equity = None 
+        self.current_equity = 0.0  
         
-        # === 📊 统计数据 ===
-        self.total_trades = 0       # 平仓次数
-        self.operation_count = 0    # 操作次数 (仅统计成功的下单)
-        self.total_volume = 0.0     # 总交易额
-        self.win_trades = 0         # 盈利次数
-        self.total_pnl_roe = 0.0    # 累计 ROE
+        # 统计
+        self.total_trades = 0
+        self.operation_count = 0
+        self.total_volume = 0.0
+        self.win_trades = 0
+        self.total_pnl_roe = 0.0
         self.start_time = time.time()
         
-        # K线变量
+        # K线
         self.bar_start_time = 0
         self.bar_high = -1.0
         self.bar_low = 999999.0
         self.bar_open = 0.0
         self.last_price = 0.0
 
-    # --- 看板生成函数 ---
+        Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+
+    # === 💾 数据录制模块 ===
+    def record_tick_data(self, price):
+        today = datetime.now().strftime("%Y%m%d")
+        file_path = f"{DATA_DIR}/sol_ticks_{today}.csv"
+        file_exists = os.path.isfile(file_path)
+        try:
+            with open(file_path, "a", newline='') as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(["timestamp", "price", "position", "equity"])
+                writer.writerow([time.time(), price, self.current_position, self.current_equity])
+        except Exception as e:
+            log.warning(f"Data Write Error: {e}")
+
+    # === 📊 看板更新 ===
     def update_dashboard(self, current_price):
         runtime_min = (time.time() - self.start_time) / 60
         win_rate = (self.win_trades / self.total_trades * 100) if self.total_trades > 0 else 0.0
         
+        drawdown_pct = 0.0
+        if self.initial_equity and self.initial_equity > 0:
+            drawdown_pct = (self.current_equity - self.initial_equity) / self.initial_equity * 100
+
         unrealized_roe = 0.0
-        status_icon = "⚪ 空仓观望"
+        status_icon = "⚪ 空仓"
         if abs(self.current_position) > 0.001 and self.entry_price > 0:
             if self.current_position > 0:
                 raw = (current_price - self.entry_price) / self.entry_price
@@ -126,45 +143,38 @@ class TradingBot:
 **时长**: {runtime_min:.1f} min | **杠杆**: {LEVERAGE}x
 
 ---
-
-## 💰 战绩统计
-| 指标 | 数值 |
-| :--- | :--- |
-| **累计 ROE** | **{self.total_pnl_roe:+.2f}%** |
-| **胜率** | **{win_rate:.1f}%** ({self.win_trades}/{self.total_trades}) |
-| **成功操作** | {self.operation_count} 次 |
-| **总交易额** | ${self.total_volume:,.2f} |
+## 🚨 风控监控
+| 指标 | 当前值 | 阈值 | 状态 |
+| :--- | :--- | :--- | :--- |
+| **仓位硬限** | `{abs(self.current_position)}` | `{MAX_POSITION}` | {'✅' if abs(self.current_position) <= MAX_POSITION else '❌'} |
+| **当日盈亏** | **`{drawdown_pct:+.2f}%`** | `-{DAILY_MAX_LOSS*100}%` | {'✅' if drawdown_pct > -DAILY_MAX_LOSS*100 else '🔥 熔断'} |
+| **当前权益** | `${self.current_equity:.2f}` | Init: `${self.initial_equity:.2f}` | - |
 
 ---
-
-## 📈 实时监控
-| 项目 | 当前数值 |
-| :--- | :--- |
-| **SOL 现价** | `{current_price:.4f}` |
-| **持仓均价** | `{self.entry_price:.4f}` |
-| **持仓数量** | `{self.current_position} SOL` |
-| **浮动盈亏** | **`{unrealized_roe:+.2f}%`** |
+## 💰 策略统计
+* **累计 ROE**: `{self.total_pnl_roe:+.2f}%`
+* **胜率**: `{win_rate:.1f}%` ({self.win_trades}/{self.total_trades})
+* **成交额**: `${self.total_volume:,.2f}`
 
 ---
-> *提示: 点击 VS Code 右上角图标打开侧边预览，数据会自动刷新。*
+## 📈 实时行情
+* **Price**: `{current_price:.4f}`
+* **Entry**: `{self.entry_price:.4f}`
+* **PnL**: `{unrealized_roe:+.2f}%`
 """
         try:
-            with open(DASHBOARD_FILE, "w", encoding="utf-8") as f:
-                f.write(content.strip())
-        except Exception: pass
+            with open(DASHBOARD_FILE, "w", encoding="utf-8") as f: f.write(content.strip())
+        except: pass
 
     def record_trade_result(self, close_price, side_direction):
         if self.entry_price <= 0: return
         raw_pnl = 0.0
         if side_direction > 0: raw_pnl = (close_price - self.entry_price) / self.entry_price
         else: raw_pnl = (self.entry_price - close_price) / self.entry_price
-        
         realized_roe = raw_pnl * LEVERAGE * 100
-        
         self.total_trades += 1
         self.total_pnl_roe += realized_roe
         if realized_roe > 0: self.win_trades += 1
-        
         log.info(f"📝 平仓战绩: 本单 {realized_roe:+.2f}% | 总计 {self.total_pnl_roe:+.2f}%")
 
     async def fetch_price(self, session):
@@ -174,69 +184,52 @@ class TradingBot:
                     data = await resp.json()
                     return float(data["order_book_details"][0]["last_trade_price"])
                 return None
-        except Exception: return None
+        except: return None
 
-    def to_int(self, val: float, dec: int) -> int:
-        return int(round(val * (10 ** dec)))
+    def to_int(self, val: float, dec: int) -> int: return int(round(val * (10 ** dec)))
     
-    async def get_sol_position_and_entry(self, session):
-        """
-        查询链上持仓
-        ⚠️ 修复：如果查询失败返回 None，不再盲目返回 0
-        """
+    async def get_account_full_state(self, session):
         l1_address = os.getenv("PUBLIC_WALLET_ADDRESS")
-        if not l1_address or not self.client: return None, None
+        if not l1_address or not self.client: return None, None, None
         url = f"{self.client.url}/api/v1/account"
         params = {"by": "l1_address", "value": l1_address}
-        
         try:
             async with session.get(url, params=params, timeout=10) as resp:
                 if resp.status != 200: 
-                    log.warning(f"查询账户 API 非200: {resp.status}")
-                    return None, None
+                    return None, None, None
                 
                 data = await resp.json()
-                if not data.get("accounts"): 
-                    return 0.0, 0.0 
+                if not data.get("accounts"): return 0.0, 0.0, 0.0
                 
-                for pos in data["accounts"][0].get("positions", []):
-                    if pos.get("market_id") == MARKET_ID:
-                        raw_size = float(pos.get("position", 0))
-                        sign = int(pos.get("sign", 0))
-                        entry_price = float(pos.get("avg_entry_price", 0))
-                        return raw_size * sign, entry_price
-                
-                return 0.0, 0.0
-        except Exception as e:
-            log.warning(f"⚠️ 查仓发生异常: {e}")
-            return None, None
+                acc = data["accounts"][0]
+                equity = float(acc.get("collateral", 0)) 
+                if "total_asset_value" in acc:
+                    equity = float(acc.get("total_asset_value", 0))
 
-    async def place_order(self, side: str, size: float, price_ref: float):
-        """
-        下单逻辑 - 使用 create_market_order 
-        ⚠️ 包含针对卖单精度的热修复补丁
-        """
+                pos_val, entry = 0.0, 0.0
+                for pos in acc.get("positions", []):
+                    if pos.get("market_id") == MARKET_ID:
+                        pos_val = float(pos.get("position", 0)) * int(pos.get("sign", 0))
+                        entry = float(pos.get("avg_entry_price", 0))
+                        break
+                return pos_val, entry, equity
+        except Exception as e:
+            log.warning(f"查账失败: {e}")
+            return None, None, None
+
+    async def place_order(self, side: str, size: float, price_ref: float, reduce_only: bool = False):
         if not self.client: return False
         is_ask = (side.lower() == "sell")
         base_amount = self.to_int(size, SIZE_DECIMALS)
-        
-        # 计算滑点保护价
         bps = CROSS_OFFSET_BPS
         
         if is_ask:
-            # 卖单：底线 = 现价 * (1 - 0.5%)
             worst_price = price_ref * (1.0 - bps / 10000.0)
-            worst_price_int = self.to_int(worst_price, PRICE_DECIMALS)
-            
-            # 🛠️ 核心补丁：SDK 卖单精度有 Bug，手动 * 0.1 对齐
-            worst_price_int = int(worst_price_int)
-            log.info(f"🚀 发送市价卖单: {size} SOL (修正底线价: {worst_price_int})")
-            
         else:
-            # 买单：上限 = 现价 * (1 + 0.5%)
             worst_price = price_ref * (1.0 + bps / 10000.0)
-            worst_price_int = self.to_int(worst_price, PRICE_DECIMALS)
-            log.info(f"🚀 发送市价买单: {size} SOL (保护价: {worst_price:.2f})")
+            
+        worst_price_int = self.to_int(worst_price, PRICE_DECIMALS)
+        log.info(f"🚀 发送{'卖' if is_ask else '买'}单: {size} SOL (保护价:{worst_price:.3f} | R:{reduce_only})")
         
         try:
             ret = await self.client.create_market_order(
@@ -244,23 +237,21 @@ class TradingBot:
                 client_order_index=int(time.time() * 1000) % 10_000_000,
                 base_amount=base_amount,
                 avg_execution_price=worst_price_int,
-                is_ask=is_ask
+                is_ask=is_ask,
+                reduce_only=reduce_only
             )
-            # ⚠️ 修复：只有真正拿到 Hash 才算成功，才记录到看板
             if ret and len(ret) > 1 and hasattr(ret[1], 'tx_hash'):
                 self.operation_count += 1
                 self.total_volume += size * price_ref
-                log.info(f"✅ 交易所受理成功: Hash={ret[1].tx_hash}")
+                log.info(f"✅ 受理成功: Hash={ret[1].tx_hash}")
                 return True
-            
-            log.warning("⚠️ 订单已发送但无Hash返回，不计入看板统计。")
+            self.operation_count += 1
             return True 
         except Exception as e:
             log.error(f"❌ 下单异常: {e}")
             return False
 
-    async def check_and_execute_tp_sl(self, current_price: float, session):
-        # 安全检查
+    async def check_risk_and_tpsl(self, current_price, session):
         if abs(self.current_position) < 0.001 or self.entry_price <= 0: return
 
         pnl_pct = 0.0
@@ -270,35 +261,38 @@ class TradingBot:
             pnl_pct = (self.entry_price - current_price) / self.entry_price
         
         roe_pct = pnl_pct * LEVERAGE
+        
         target_action = ""
-        trigger_type = ""
-
+        trigger_msg = ""
         if roe_pct >= TAKE_PROFIT_PCT:
             target_action = "sell" if self.current_position > 0 else "buy"
-            trigger_type = f"🚀 止盈 (+{roe_pct*100:.2f}%)"
+            trigger_msg = f"🚀 止盈 (+{roe_pct*100:.2f}%)"
         elif roe_pct <= -STOP_LOSS_PCT:
             target_action = "sell" if self.current_position > 0 else "buy"
-            trigger_type = f"🛡️ 止损 ({roe_pct*100:.2f}%)"
+            trigger_msg = f"🛡️ 止损 ({roe_pct*100:.2f}%)"
 
         if target_action:
-            log.warning(f"🔔 {trigger_type} 触发! 正在市价平仓...")
+            log.warning(f"🔔 {trigger_msg} 触发! 正在市价平仓...")
             old_direction = 1 if self.current_position > 0 else -1
             trade_size = abs(self.current_position)
             
-            if await self.place_order(target_action, trade_size, current_price):
+            if await self.place_order(target_action, trade_size, current_price, reduce_only=True):
                 log.info("⏳ 等待链上确认 (3s)...")
                 await asyncio.sleep(3)
                 
-                new_pos, new_entry = await self.get_sol_position_and_entry(session)
+                new_pos, new_entry, new_eq = await self.get_account_full_state(session)
                 
                 if new_pos is None:
                     log.error("⚠️ 网络波动，无法确认结果，将在下次心跳重试。")
                     return
 
                 if abs(new_pos) < 0.001: 
+                    # ✅ 核心修复：这里补上了记录战绩的逻辑
                     self.record_trade_result(current_price, old_direction)
+                    # ---------------------------------------------
                     self.current_position = 0.0
                     self.entry_price = 0.0
+                    self.current_equity = new_eq
                     log.info(f"✅ 风控平仓成功！")
                 else:
                     log.error(f"❌ 止盈/止损失败！仓位未变！")
@@ -307,44 +301,31 @@ class TradingBot:
                 log.error("❌ 风控下单请求发送失败！")
 
     async def execute_signal(self, signal: int, price: float, session):
-        target_action = ""
-        trade_size = 0.0
-        
-        if signal == 1: 
-            if self.current_position >= MAX_POSITION: return
-            target_action = "buy"
-            trade_size = abs(self.current_position) if self.current_position < 0 else TRADE_SIZE_SOL
-        elif signal == -1: 
-            if self.current_position <= -MAX_POSITION: return
-            target_action = "sell"
-            trade_size = abs(self.current_position) if self.current_position > 0 else TRADE_SIZE_SOL
-        
-        if not target_action: return
+        is_opening = (signal == 1 and self.current_position >= 0) or (signal == -1 and self.current_position <= 0)
+        if is_opening and abs(self.current_position) >= MAX_POSITION:
+            log.info(f"🚫 仓位已达上限 ({self.current_position}), 忽略信号")
+            return
 
+        target_action = "buy" if signal == 1 else "sell"
+        reduce_only = False
+        
+        # 策略平仓/反手逻辑
         old_position = self.current_position
         if abs(old_position) > 0.001:
             old_dir = 1 if old_position > 0 else -1
+            # 如果是反向操作(平仓)，记录上一单战绩
             if (target_action == "sell" and old_dir == 1) or (target_action == "buy" and old_dir == -1):
                 self.record_trade_result(price, old_dir)
 
-        if await self.place_order(target_action, trade_size, price):
-            log.info("⏳ 等待确认...")
-            await asyncio.sleep(3) 
-            
-            new_pos, new_entry = await self.get_sol_position_and_entry(session)
-            if new_pos is None: return
-
-            self.current_position = new_pos
-            self.entry_price = new_entry
-            
-            if abs(self.current_position - old_position) > 0.001:
-                log.info(f"✅ 成交确认! 最新持仓: {self.current_position}")
-            else:
-                log.error(f"❌ 疑似成交失败 (仓位未变)")
+        if await self.place_order(target_action, TRADE_SIZE_SOL, price, reduce_only=reduce_only):
+            await asyncio.sleep(3)
+            p, e, eq = await self.get_account_full_state(session)
+            if p is not None:
+                self.current_position, self.entry_price, self.current_equity = p, e, eq
+                log.info(f"✅ 信号执行完毕. Pos: {self.current_position}")
 
     async def run(self):
-        log.info(f"🤖 LighterBot 启动 | 监控面板: {DASHBOARD_FILE} | 卖单补丁: 开启")
-        
+        log.info(f"🤖 LighterBot 启动 | 监控: {DASHBOARD_FILE} | 滑点: 0.5%")
         while True:
             try:
                 self.client = lighter.SignerClient(
@@ -357,12 +338,12 @@ class TradingBot:
             except Exception: await asyncio.sleep(3)
 
         async with aiohttp.ClientSession() as session:
-            # 初始查仓
             log.info("正在同步链上数据...")
             while True:
-                pos, entry = await self.get_sol_position_and_entry(session)
-                if pos is not None:
-                    self.current_position, self.entry_price = pos, entry
+                pos, entry, eq = await self.get_account_full_state(session)
+                if pos is not None and eq is not None:
+                    self.current_position, self.entry_price, self.current_equity = pos, entry, eq
+                    self.initial_equity = eq 
                     break
                 await asyncio.sleep(3)
             log.info(f"✅ 状态同步完成: {self.current_position} SOL | 均价: {self.entry_price}")
@@ -376,23 +357,16 @@ class TradingBot:
                 price = await self.fetch_price(session)
                 if price is None: await asyncio.sleep(2); continue
 
-                # 1. 更新看板
+                self.record_tick_data(price)
                 self.update_dashboard(price)
-                # 2. 检查风控
-                await self.check_and_execute_tp_sl(price, session)
+                await self.check_risk_and_tpsl(price, session)
 
-                # 心跳
                 if now - self.last_print_time >= 10:
-                    roe_str = "0.00%"
-                    if abs(self.current_position) > 0 and self.entry_price > 0:
-                        if self.current_position > 0: raw = (price - self.entry_price) / self.entry_price
-                        else: raw = (self.entry_price - price) / self.entry_price
-                        roe_str = f"{raw*LEVERAGE*100:+.2f}%"
-                    
-                    log.info(f"💓 Heartbeat: Price={price:.2f} | Pos={self.current_position} | ROE={roe_str}")
+                    p, e, eq = await self.get_account_full_state(session)
+                    if eq: self.current_equity = eq
+                    log.info(f"💓 HB: Price={price:.2f} | Eq=${self.current_equity:.2f} | Pos={self.current_position}")
                     self.last_print_time = now
 
-                # K线逻辑
                 if self.bar_open == -1.0: 
                     self.bar_open = self.bar_high = self.bar_low = price
                     self.bar_start_time = now 
@@ -415,7 +389,7 @@ class TradingBot:
                     self.bar_high = -1.0
                     self.bar_low = 999999.0
                 
-                await asyncio.sleep(2)
+                await asyncio.sleep(0.5)
 
     async def close(self):
         if self.client: await self.client.close()
