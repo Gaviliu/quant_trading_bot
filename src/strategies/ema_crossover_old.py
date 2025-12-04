@@ -2,7 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from collections import deque
-from typing import Optional, Deque
+from typing import Optional, Deque, Tuple
 
 @dataclass
 class _EMA:
@@ -21,10 +21,15 @@ class _EMA:
 
 class EMACrossover:
     """
-    流式 EMA 穿越策略（优化版）
-    新增特性：
-    1. 斜率过滤 (Slope Filter): 防止均线拐头时逆势操作
-    2. 价格位置过滤 (Price Pos): 阴跌时价格在均线下方不接飞刀
+    流式 EMA 穿越策略（与 runner 对齐）
+    - on_close_fast_adapt(close, high, low) -> 1/-1/0
+    - set_position_side(pos) : 通知当前持仓(1/-1/0)，用于抑制同向重复信号
+    过滤项：
+      * confirm_bars 连续K确认
+      * band_mode: "bps" -> gap_pct >= band_bps/10000
+                   "atr_pct" -> gap_pct >= atr_k * (ATR/price)
+      * trend_ema: 多头仅在 price>=EMA_trend；空头仅在 price<=EMA_trend
+      * cooldown_bars: 触发后冷却N根
     """
 
     def __init__(
@@ -40,9 +45,6 @@ class EMACrossover:
         mute_same_dir_when_holding: bool = True,
         print_ema_each_bar: bool = False,
         atr_period: int = 14,
-        # === 新增优化参数 ===
-        check_slope: bool = True,      # 开启斜率检查（快线必须朝向有利方向）
-        check_price_pos: bool = True   # 开启价格位置检查（做多时价>快线）
     ):
         assert fast > 0 and slow > 0 and fast < slow, "fast/slow 参数不合法"
         assert band_mode in ("bps", "atr_pct"), "band_mode 仅支持 bps/atr_pct"
@@ -65,20 +67,13 @@ class EMACrossover:
         self.cooldown_bars = max(0, int(cooldown_bars))
         self.mute_same_dir_when_holding = bool(mute_same_dir_when_holding)
         self.print_ema_each_bar = bool(print_ema_each_bar)
-        
-        # 新增优化开关
-        self.check_slope = check_slope
-        self.check_price_pos = check_price_pos
 
         # 状态
-        self._cross_dir: int = 0        # 最近一根K的穿越方向
+        self._cross_dir: int = 0        # 最近一根K的穿越方向：1,-1,0
         self._streak: int = 0           # 连续满足方向的计数
         self._cooldown_left: int = 0
-        self._holding_side: int = 0     
-        self._last_signal: int = 0      
-        
-        # 记录上一根K线的快线值，用于计算斜率
-        self._prev_fast_val: Optional[float] = None 
+        self._holding_side: int = 0     # 由 set_position_side(pos) 注入
+        self._last_signal: int = 0      # 上一次发出的信号(1/-1/0)
 
     # ============== 工具 ==============
     @staticmethod
@@ -120,7 +115,7 @@ class EMACrossover:
             self._tr_hist.append(tr)
             self._atr = (sum(self._tr_hist) / len(self._tr_hist)) if self._tr_hist else tr
         else:
-            # Wilder EMA
+            # Wilder EMA: ATR_t = ATR_{t-1}*(n-1)/n + TR_t/n
             self._atr = (self._atr * (self.atr_period - 1) + tr) / self.atr_period  # type: ignore
 
     # ============== 对外接口 ==============
@@ -134,8 +129,6 @@ class EMACrossover:
         返回：1=做多，-1=做空，0=无动作
         """
         px = float(close)
-        
-        # 1. 更新指标
         f = self.fast_ema.update(px)
         s = self.slow_ema.update(px)
         if self.trend_ema is not None:
@@ -143,45 +136,20 @@ class EMACrossover:
         self._update_atr(float(high), float(low), px)
 
         if self.print_ema_each_bar:
-            slope_str = "N/A"
-            if self._prev_fast_val is not None:
-                diff = f - self._prev_fast_val
-                slope_str = "UP" if diff > 0 else "DOWN"
-            print(f"[EMA] fast={f:.6f} slow={s:.6f} slope={slope_str}")
+            print(f"[EMA] fast={f:.6f} slow={s:.6f} trend={self.trend_ema.value if self.trend_ema else None}")
 
         # 初期EMA尚未就绪
         if self.fast_ema.value is None or self.slow_ema.value is None:
-            self._prev_fast_val = f
             return 0
 
-        # 2. 判断基础方向：fast 相对 slow
+        # 方向：fast 相对 slow
         dir_now = 1 if f > s else (-1 if f < s else 0)
 
-        # === 🛡️ 核心优化：动能与位置过滤 ===
-        
-        # (A) 斜率过滤：快线必须朝向有利方向
-        if self.check_slope and self._prev_fast_val is not None:
-            fast_slope = f - self._prev_fast_val
-            if dir_now == 1 and fast_slope <= 0: # 想做多，但快线在变平或向下 -> 拒绝
-                dir_now = 0
-            elif dir_now == -1 and fast_slope >= 0: # 想做空，但快线在变平或向上 -> 拒绝
-                dir_now = 0
-
-        # (B) 价格位置过滤：做多时价格要在快线之上
-        if self.check_price_pos and dir_now != 0:
-            if dir_now == 1 and px < f: # 价格掉到快线下面了 -> 拒绝追高
-                dir_now = 0
-            elif dir_now == -1 and px > f: # 价格反弹到快线上面了 -> 拒绝追空
-                dir_now = 0
-        
-        # 更新上一根K线的快线值 (供下次计算斜率用)
-        self._prev_fast_val = f
-
-        # 3. 冷却计时
+        # 冷却计时
         if self._cooldown_left > 0:
             self._cooldown_left -= 1
 
-        # 4. 连续确认逻辑
+        # 连续确认
         if dir_now == 0:
             self._streak = 0
             self._cross_dir = 0
@@ -197,26 +165,25 @@ class EMACrossover:
         if self._streak < self.confirm_bars:
             return 0
 
-        # 5. 带宽过滤 (Gap)
+        # 带宽过滤
         gap = self._gap_pct(f, s, px)
         if not self._band_ok(gap, px):
             return 0
 
-        # 6. 趋势过滤 (Trend EMA)
+        # 趋势过滤
         if not self._trend_ok(px, dir_now):
             return 0
 
-        # 7. 冷却期检查
+        # 冷却期内不发新信号
         if self._cooldown_left > 0:
             return 0
 
-        # 8. 持仓状态检查 (静音)
+        # 如果正在持有同向仓位，且要求静音，则不重复发信号
         if self.mute_same_dir_when_holding and dir_now == self._holding_side and self._holding_side != 0:
             return 0
 
-        # 9. 最终触发信号
+        # 通过所有条件 -> 触发信号
         self._last_signal = dir_now
         if self.cooldown_bars > 0:
             self._cooldown_left = self.cooldown_bars
-            
         return dir_now

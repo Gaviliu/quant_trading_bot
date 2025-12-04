@@ -10,10 +10,11 @@ from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 
+# 引入你的模块
 import lighter
 from strategies.ema_crossover import EMACrossover
 
-# ================= 1. 日志配置 =================
+# ================= 1. 专业彩色日志配置 =================
 class ColoredFormatter(logging.Formatter):
     grey = "\x1b[38;20m"
     yellow = "\x1b[33;20m"
@@ -38,7 +39,6 @@ class ColoredFormatter(logging.Formatter):
         elif record.levelno == logging.ERROR: color = self.red
         elif "Heartbeat" in record.msg: color = self.blue
         elif "Data" in record.msg: color = self.cyan
-        elif "决策" in record.msg: color = self.yellow # 决策信息高亮
         else: color = self.grey
         formatter = logging.Formatter(f"{color}{log_fmt}{self.reset}")
         return formatter.format(record)
@@ -52,24 +52,23 @@ ch.setFormatter(ColoredFormatter())
 log.addHandler(ch)
 
 # ================= 配置区域 =================
-CANDLE_INTERVAL = 900    # 15分钟 (900秒)
+CANDLE_INTERVAL = 900     # K线周期 30s
 EMA_FAST = 3
 EMA_SLOW = 20
-init_band_bps = 10       # 带宽要求 10 bps (0.1%)
-
-TRADE_SIZE_SOL = 0.1      
-MAX_POSITION = 0.1        
+init_band_bps = 10
+TRADE_SIZE_SOL = 1      
+MAX_POSITION = 1        # 单方向最大持仓限制
 
 # --- 风控配置 ---
-LEVERAGE = 10            
-TAKE_PROFIT_PCT = 0.05   # 5%
-STOP_LOSS_PCT = 0.02     # 2%
-DAILY_MAX_LOSS = 0.10    
+LEVERAGE = 10             # 杠杆倍数
+TAKE_PROFIT_PCT = 0.05    # 止盈 2% (ROE)
+STOP_LOSS_PCT = 0.02      # 止损 2% (ROE)
+DAILY_MAX_LOSS = 0.10     # 🔥 熔断线
 
-PRICE_DECIMALS = 3        
+PRICE_DECIMALS = 3      # 价格精度 (官方确认)
 SIZE_DECIMALS = 3
-CROSS_OFFSET_BPS = 50     # 滑点 0.5%
-MARKET_ID = 2             
+CROSS_OFFSET_BPS = 500     # 滑点 0.5%
+MARKET_ID = 2             # SOL
 PRICE_URL = "https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails?market_id=2"
 DASHBOARD_FILE = "DASHBOARD.md"
 DATA_DIR = "data"         
@@ -78,14 +77,15 @@ class TradingBot:
     def __init__(self):
         load_dotenv()
         self.client = None
-        # 关闭策略内部打印，由主程序接管详细打印
-        self.strategy = EMACrossover(fast=EMA_FAST, slow=EMA_SLOW, band_mode="bps", band_bps=init_band_bps, print_ema_each_bar=False)
+        self.strategy = EMACrossover(fast=EMA_FAST, slow=EMA_SLOW, band_mode="bps", band_bps=init_band_bps, print_ema_each_bar=True)
         
+        # 核心状态
         self.current_position = 0.0
         self.entry_price = 0.0
         self.initial_equity = None 
         self.current_equity = 0.0  
         
+        # 统计
         self.total_trades = 0
         self.operation_count = 0
         self.total_volume = 0.0
@@ -93,17 +93,16 @@ class TradingBot:
         self.total_pnl_roe = 0.0
         self.start_time = time.time()
         
+        # K线
         self.bar_start_time = 0
         self.bar_high = -1.0
         self.bar_low = 999999.0
         self.bar_open = 0.0
         self.last_price = 0.0
-        
-        # 状态展示用
-        self.last_decision_log = "等待数据..."
 
         Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 
+    # === 💾 数据录制模块 ===
     def record_tick_data(self, price):
         today = datetime.now().strftime("%Y%m%d")
         file_path = f"{DATA_DIR}/sol_ticks_{today}.csv"
@@ -117,13 +116,17 @@ class TradingBot:
         except Exception as e:
             log.warning(f"Data Write Error: {e}")
 
-    # === 📊 看板更新 (增加倒计时) ===
-    def update_dashboard(self, current_price, countdown_str):
+    # === 📊 看板更新 ===
+    def update_dashboard(self, current_price):
         runtime_min = (time.time() - self.start_time) / 60
         win_rate = (self.win_trades / self.total_trades * 100) if self.total_trades > 0 else 0.0
         
+        drawdown_pct = 0.0
+        if self.initial_equity and self.initial_equity > 0:
+            drawdown_pct = (self.current_equity - self.initial_equity) / self.initial_equity * 100
+
         unrealized_roe = 0.0
-        status_icon = "⚪ 空仓观望"
+        status_icon = "⚪ 空仓"
         if abs(self.current_position) > 0.001 and self.entry_price > 0:
             if self.current_position > 0:
                 raw = (current_price - self.entry_price) / self.entry_price
@@ -132,31 +135,32 @@ class TradingBot:
                 raw = (self.entry_price - current_price) / self.entry_price
                 status_icon = "🔴 持有空单"
             unrealized_roe = raw * LEVERAGE * 100
-        
-        # 获取 EMA 值
-        f_val = self.strategy.fast_ema.value
-        s_val = self.strategy.slow_ema.value
-        f_str = f"{f_val:.3f}" if f_val else "N/A"
-        s_str = f"{s_val:.3f}" if s_val else "N/A"
 
         content = f"""
-# 🤖 LighterBot 驾驶舱
+# 🤖 Lighter Quant Dashboard
 
-**状态**: {status_icon} | **倒计时**: `{countdown_str}`
-**参数**: EMA {EMA_FAST}/{EMA_SLOW} | Band {init_band_bps} bps
-
----
-## 🧠 策略诊断 (15min K线)
-* **当前快线**: `{f_str}`
-* **当前慢线**: `{s_str}`
-* **最近决策**: `{self.last_decision_log}`
+**状态**: {status_icon} | **更新**: {time.strftime('%H:%M:%S')}
+**时长**: {runtime_min:.1f} min | **杠杆**: {LEVERAGE}x
 
 ---
-## 💰 账户概览
-* **当前权益**: `${self.current_equity:.2f}` (Init: ${self.initial_equity:.2f})
-* **累计 ROE**: **{self.total_pnl_roe:+.2f}%**
-* **实盘胜率**: `{win_rate:.1f}%` ({self.win_trades}/{self.total_trades})
-* **浮动盈亏**: **`{unrealized_roe:+.2f}%`**
+## 🚨 风控监控
+| 指标 | 当前值 | 阈值 | 状态 |
+| :--- | :--- | :--- | :--- |
+| **仓位硬限** | `{abs(self.current_position)}` | `{MAX_POSITION}` | {'✅' if abs(self.current_position) <= MAX_POSITION else '❌'} |
+| **当日盈亏** | **`{drawdown_pct:+.2f}%`** | `-{DAILY_MAX_LOSS*100}%` | {'✅' if drawdown_pct > -DAILY_MAX_LOSS*100 else '🔥 熔断'} |
+| **当前权益** | `${self.current_equity:.2f}` | Init: `${self.initial_equity:.2f}` | - |
+
+---
+## 💰 策略统计
+* **累计 ROE**: `{self.total_pnl_roe:+.2f}%`
+* **胜率**: `{win_rate:.1f}%` ({self.win_trades}/{self.total_trades})
+* **成交额**: `${self.total_volume:,.2f}`
+
+---
+## 📈 实时行情
+* **Price**: `{current_price:.4f}`
+* **Entry**: `{self.entry_price:.4f}`
+* **PnL**: `{unrealized_roe:+.2f}%`
 """
         try:
             with open(DASHBOARD_FILE, "w", encoding="utf-8") as f: f.write(content.strip())
@@ -191,11 +195,17 @@ class TradingBot:
         params = {"by": "l1_address", "value": l1_address}
         try:
             async with session.get(url, params=params, timeout=10) as resp:
-                if resp.status != 200: return None, None, None
+                if resp.status != 200: 
+                    return None, None, None
+                
                 data = await resp.json()
                 if not data.get("accounts"): return 0.0, 0.0, 0.0
+                
                 acc = data["accounts"][0]
-                equity = float(acc.get("total_asset_value", acc.get("collateral", 0)))
+                equity = float(acc.get("collateral", 0)) 
+                if "total_asset_value" in acc:
+                    equity = float(acc.get("total_asset_value", 0))
+
                 pos_val, entry = 0.0, 0.0
                 for pos in acc.get("positions", []):
                     if pos.get("market_id") == MARKET_ID:
@@ -213,11 +223,14 @@ class TradingBot:
         base_amount = self.to_int(size, SIZE_DECIMALS)
         bps = CROSS_OFFSET_BPS
         
-        if is_ask: worst_price = price_ref * (1.0 - bps / 10000.0)
-        else: worst_price = price_ref * (1.0 + bps / 10000.0)
+        if is_ask:
+            worst_price = price_ref * (1.0 - bps / 10000.0)
+        else:
+            worst_price = price_ref * (1.0 + bps / 10000.0)
+            
         worst_price_int = self.to_int(worst_price, PRICE_DECIMALS)
-        
         log.info(f"🚀 发送{'卖' if is_ask else '买'}单: {size} SOL (保护价:{worst_price:.3f} | R:{reduce_only})")
+        
         try:
             ret = await self.client.create_market_order(
                 market_index=MARKET_ID,
@@ -239,18 +252,14 @@ class TradingBot:
             return False
 
     async def check_risk_and_tpsl(self, current_price, session):
-        if self.initial_equity is None or self.initial_equity == 0: return
-
-        drawdown_pct = (self.current_equity - self.initial_equity) / self.initial_equity
-        if drawdown_pct <= -DAILY_MAX_LOSS:
-            log.error(f"🔥 [严重] 触发熔断！亏损 {drawdown_pct*100:.2f}%")
-            if abs(self.current_position) > 0.001:
-                action = "sell" if self.current_position > 0 else "buy"
-                await self.place_order(action, abs(self.current_position), current_price, reduce_only=True)
-            sys.exit(1)
-
         if abs(self.current_position) < 0.001 or self.entry_price <= 0: return
-        pnl_pct = (current_price - self.entry_price) / self.entry_price if self.current_position > 0 else (self.entry_price - current_price) / self.entry_price
+
+        pnl_pct = 0.0
+        if self.current_position > 0:
+            pnl_pct = (current_price - self.entry_price) / self.entry_price
+        elif self.current_position < 0:
+            pnl_pct = (self.entry_price - current_price) / self.entry_price
+        
         roe_pct = pnl_pct * LEVERAGE
         
         target_action = ""
@@ -263,21 +272,33 @@ class TradingBot:
             trigger_msg = f"🛡️ 止损 ({roe_pct*100:.2f}%)"
 
         if target_action:
-            log.warning(f"🔔 {trigger_msg} 触发!")
-            if await self.place_order(target_action, abs(self.current_position), current_price, reduce_only=True):
-                log.info("⏳ 等待确认...")
+            log.warning(f"🔔 {trigger_msg} 触发! 正在市价平仓...")
+            old_direction = 1 if self.current_position > 0 else -1
+            trade_size = abs(self.current_position)
+            
+            if await self.place_order(target_action, trade_size, current_price, reduce_only=True):
+                log.info("⏳ 等待链上确认 (3s)...")
                 await asyncio.sleep(3)
-                p, e, eq = await self.get_account_full_state(session)
-                if abs(p) < 0.001: 
-                    old_dir = 1 if target_action == "sell" else -1
-                    self.record_trade_result(current_price, old_dir)
+                
+                new_pos, new_entry, new_eq = await self.get_account_full_state(session)
+                
+                if new_pos is None:
+                    log.error("⚠️ 网络波动，无法确认结果，将在下次心跳重试。")
+                    return
+
+                if abs(new_pos) < 0.001: 
+                    # ✅ 核心修复：这里补上了记录战绩的逻辑
+                    self.record_trade_result(current_price, old_direction)
+                    # ---------------------------------------------
                     self.current_position = 0.0
                     self.entry_price = 0.0
-                    self.current_equity = eq
-                    log.info("✅ 风控平仓成功")
+                    self.current_equity = new_eq
+                    log.info(f"✅ 风控平仓成功！")
                 else:
-                    log.error("❌ 风控平仓失败")
-                    self.current_position = p 
+                    log.error(f"❌ 止盈/止损失败！仓位未变！")
+                    self.current_position = new_pos 
+            else:
+                log.error("❌ 风控下单请求发送失败！")
 
     async def execute_signal(self, signal: int, price: float, session):
         is_opening = (signal == 1 and self.current_position >= 0) or (signal == -1 and self.current_position <= 0)
@@ -288,9 +309,11 @@ class TradingBot:
         target_action = "buy" if signal == 1 else "sell"
         reduce_only = False
         
-        old_pos = self.current_position
-        if abs(old_pos) > 0.001:
-            old_dir = 1 if old_pos > 0 else -1
+        # 策略平仓/反手逻辑
+        old_position = self.current_position
+        if abs(old_position) > 0.001:
+            old_dir = 1 if old_position > 0 else -1
+            # 如果是反向操作(平仓)，记录上一单战绩
             if (target_action == "sell" and old_dir == 1) or (target_action == "buy" and old_dir == -1):
                 self.record_trade_result(price, old_dir)
 
@@ -302,7 +325,7 @@ class TradingBot:
                 log.info(f"✅ 信号执行完毕. Pos: {self.current_position}")
 
     async def run(self):
-        log.info(f"🤖 LighterBot 启动 | K线: {CANDLE_INTERVAL/60}min | 策略: EMA{EMA_FAST}/{EMA_SLOW}")
+        log.info(f"🤖 LighterBot 启动 | 监控: {DASHBOARD_FILE} | 滑点: 0.5%")
         while True:
             try:
                 self.client = lighter.SignerClient(
@@ -315,7 +338,7 @@ class TradingBot:
             except Exception: await asyncio.sleep(3)
 
         async with aiohttp.ClientSession() as session:
-            log.info("正在同步数据...")
+            log.info("正在同步链上数据...")
             while True:
                 pos, entry, eq = await self.get_account_full_state(session)
                 if pos is not None and eq is not None:
@@ -323,7 +346,7 @@ class TradingBot:
                     self.initial_equity = eq 
                     break
                 await asyncio.sleep(3)
-            log.info(f"✅ 就绪 | 持仓: {self.current_position}")
+            log.info(f"✅ 状态同步完成: {self.current_position} SOL | 均价: {self.entry_price}")
 
             self.bar_start_time = time.time()
             self.last_print_time = time.time()
@@ -335,21 +358,13 @@ class TradingBot:
                 if price is None: await asyncio.sleep(2); continue
 
                 self.record_tick_data(price)
+                self.update_dashboard(price)
                 await self.check_risk_and_tpsl(price, session)
-                
-                # 计算倒计时
-                time_elapsed = now - self.bar_start_time
-                time_left = max(0, CANDLE_INTERVAL - time_elapsed)
-                mins, secs = divmod(int(time_left), 60)
-                countdown_str = f"{mins:02d}:{secs:02d}"
-
-                self.update_dashboard(price, countdown_str)
 
                 if now - self.last_print_time >= 10:
                     p, e, eq = await self.get_account_full_state(session)
                     if eq: self.current_equity = eq
-                    # Heartbeat 增加倒计时显示
-                    log.info(f"💓 HB: Price={price:.2f} | Pos={self.current_position} | NextK: {countdown_str}")
+                    log.info(f"💓 HB: Price={price:.2f} | Eq=${self.current_equity:.2f} | Pos={self.current_position}")
                     self.last_print_time = now
 
                 if self.bar_open == -1.0: 
@@ -359,61 +374,17 @@ class TradingBot:
                     self.bar_high = max(self.bar_high, price)
                     self.bar_low = min(self.bar_low, price)
 
-                # === K线闭合逻辑 ===
                 if now - self.bar_start_time >= CANDLE_INTERVAL:
                     close_price = price
+                    log.info(f"📊 K线闭合: C={close_price:.2f}")
                     
-                    # 1. 计算信号
-                    signal = self.strategy.on_close_fast_adapt(close_price, self.bar_high, self.bar_low)
-                    
-                    # 2. 🕵️‍♂️ 核心诊断：为什么没开单？
-                    reason = ""
-                    if signal == 0:
-                        # 提取策略内部值 (需要策略类支持访问)
-                        f_val = self.strategy.fast_ema.value
-                        s_val = self.strategy.slow_ema.value
-                        prev_f = getattr(self.strategy, '_prev_fast_val', None)
-                        
-                        if f_val is None or s_val is None:
-                            reason = "⏳ 均线计算中 (数据不足)"
-                        else:
-                            gap = abs(f_val - s_val) / close_price
-                            threshold = init_band_bps / 10000.0
-                            
-                            if gap < threshold:
-                                reason = f"❌ 震荡 (Gap {gap*10000:.1f} < {init_band_bps} bps)"
-                            elif f_val > s_val: # 多头
-                                slope = f_val - prev_f if prev_f else 0
-                                if slope <= 0: reason = "❌ 快线拐头向下 (动能不足)"
-                                elif close_price < f_val: reason = f"❌ 价格 < 快线 (位置不佳)"
-                                else: reason = "⚖️ 趋势未确认"
-                            else: # 空头
-                                slope = f_val - prev_f if prev_f else 0
-                                if slope >= 0: reason = "❌ 快线拐头向上 (动能不足)"
-                                elif close_price > f_val: reason = f"❌ 价格 > 快线 (位置不佳)"
-                                else: reason = "⚖️ 趋势未确认"
-                    else:
-                        reason = "✅ 信号触发！"
-                    
-                    self.last_decision_log = reason
-                    log.info(f"📊 K线闭合: C={close_price:.2f} | 决策: {reason}")
-                    
-                    # 3. 执行信号
                     pos_dir = 1 if self.current_position > 0.001 else (-1 if self.current_position < -0.001 else 0)
                     self.strategy.set_position_side(pos_dir)
+                    signal = self.strategy.on_close_fast_adapt(close_price, self.bar_high, self.bar_low)
                     
                     if signal != 0:
                         await self.execute_signal(signal, close_price, session)
-                    elif signal == 0 and abs(self.current_position) > 0.001:
-                        # 信号消失逻辑：如果在持仓，但趋势没了，也应该平仓
-                        log.info(f"📉 趋势消失 ({reason})，执行平仓...")
-                        old_dir = 1 if self.current_position > 0 else -1
-                        self.record_trade_result(close_price, old_dir)
-                        action = "sell" if self.current_position > 0 else "buy"
-                        await self.place_order(action, abs(self.current_position), close_price, reduce_only=True)
-                        self.current_position = 0.0
                     
-                    # 重置 K 线
                     self.bar_open = -1.0
                     self.bar_high = -1.0
                     self.bar_low = 999999.0
