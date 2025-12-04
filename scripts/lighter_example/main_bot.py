@@ -52,16 +52,16 @@ ch.setFormatter(ColoredFormatter())
 log.addHandler(ch)
 
 # ================= 配置区域 =================
-CANDLE_INTERVAL = 30     # K线周期 30s
+CANDLE_INTERVAL = 900     # K线周期 30s
 EMA_FAST = 3
-EMA_SLOW = 26
+EMA_SLOW = 20
 init_band_bps = 10
-TRADE_SIZE_SOL = 0.1      
-MAX_POSITION = 0.1        # 单方向最大持仓限制
+TRADE_SIZE_SOL = 1      
+MAX_POSITION = 1        # 单方向最大持仓限制
 
 # --- 风控配置 ---
 LEVERAGE = 10             # 杠杆倍数
-TAKE_PROFIT_PCT = 0.02    # 止盈 2% (ROE)
+TAKE_PROFIT_PCT = 0.05    # 止盈 2% (ROE)
 STOP_LOSS_PCT = 0.02      # 止损 2% (ROE)
 DAILY_MAX_LOSS = 0.10     # 🔥 熔断线
 
