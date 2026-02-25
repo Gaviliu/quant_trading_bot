@@ -5,7 +5,7 @@ import lighter
 from dotenv import load_dotenv
 
 # === 测试配置 ===
-SIZE_SOL = 0.01          # 测试金额
+SIZE_SOL = 0.1          # 测试金额
 PRICE_DECIMALS = 3       # 价格精度 (标准精度)
 SIZE_DECIMALS = 3        # 数量精度 (标准精度)
 MARKET_ID = 2            # SOL
@@ -92,7 +92,9 @@ async def main():
             is_ask=False 
         )
         if ret_buy and len(ret_buy) > 1:
-            log.info(f"✅ 买单发送成功: Hash={ret_buy[1].tx_hash}")
+                    # 如果 ret_buy[1] 是 None，就显示 "无Hash"，防止报错
+                    tx_hash = ret_buy[1].tx_hash if ret_buy[1] else "无Hash-等待上链"
+                    log.info(f"✅ 买单发送成功: Hash={tx_hash}")
     except Exception as e:
         log.error(f"❌ 买单报错: {e}")
         await client.close(); return
@@ -130,8 +132,11 @@ async def main():
             avg_execution_price=int(sell_price_int),
             is_ask=True # True = 卖
         )
+        # if ret_sell and len(ret_sell) > 1:
+        #     log.info(f"✅ 卖单发送成功: Hash={ret_sell[1].tx_hash}")
         if ret_sell and len(ret_sell) > 1:
-            log.info(f"✅ 卖单发送成功: Hash={ret_sell[1].tx_hash}")
+                tx_hash = ret_sell[1].tx_hash if ret_sell[1] else "无Hash-等待上链"
+                log.info(f"✅ 卖单发送成功: Hash={tx_hash}")
     except Exception as e:
         log.error(f"❌ 卖单报错: {e}")
 
